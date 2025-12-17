@@ -1,0 +1,142 @@
+name: Backend CI/CD (push → branch with open PR)
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch: {}
+
+jobs:
+  check-pr:
+    name: Check for open PR on branch
+    runs-on: ubuntu-latest
+    outputs:
+      has-pr: ${{ steps.check.outputs.has_pr }}
+    steps:
+      - name: Determine current branch
+        id: ref
+        run: echo "branch=$(echo ${GITHUB_REF#refs/heads/})" >> "$GITHUB_OUTPUT"
+
+      - name: Check if current branch has an open PR
+        id: check
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const branch = process.env.branch || process.env.GITHUB_REF.replace('refs/heads/','');
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              head: `${context.repo.owner}:${branch}`
+            });
+            core.setOutput('has_pr', prs.length > 0 ? 'true' : 'false');
+
+  build-and-test:
+    name: Run backend tests and build
+    needs: check-pr
+    if: needs.check-pr.outputs.has-pr == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '16'
+
+      - name: Cache backend node modules
+        uses: actions/cache@v4
+        with:
+          path: backend/node_modules
+          key: ${{ runner.os }}-backend-${{ hashFiles('backend/package-lock.json','backend/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-backend-
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Run backend tests
+        working-directory: backend
+        run: npm test --if-present
+        env:
+          CI: true
+
+      - name: Build backend
+        working-directory: backend
+        run: npm run build --if-present
+
+      - name: Upload backend build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-build
+          path: backend/dist
+
+  deploy-to-ec2:
+    name: Deploy backend to EC2
+    needs: build-and-test
+    if: needs.check-pr.outputs.has-pr == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download backend build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-build
+          path: ./artifact
+
+      - name: Package artifact
+        run: |
+          mkdir -p deploy
+          tar -czf deploy/backend-dist.tar.gz -C artifact dist
+
+      - name: Copy build to EC2 (SCP)
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT || 22 }}
+          source: "deploy/backend-dist.tar.gz"
+          target: ${{ secrets.EC2_DEPLOY_PATH }}
+
+      - name: Deploy on EC2 and restart service (SSH)
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT || 22 }}
+          script: |
+            set -e
+            DEPLOY_DIR="${{ secrets.EC2_DEPLOY_PATH }}"
+            mkdir -p "$DEPLOY_DIR"
+            tar -xzf "$DEPLOY_DIR/backend-dist.tar.gz" -C "$DEPLOY_DIR"
+            # Create .env from secrets (adjust variables as needed)
+            cat > "$DEPLOY_DIR/.env" <<'EOF'
+            DATABASE_URL=${{ secrets.DATABASE_URL }}
+            NODE_ENV=production
+            EOF
+            cd "$DEPLOY_DIR/dist" || exit 1
+            # Ensure pm2 is installed on the server (assumed already installed per README)
+            pm2 startOrReload <(cat <<'ECO')
+            module.exports = {
+              apps : [{
+                name: "lti-backend",
+                script: "index.js",
+                cwd: "${DEPLOY_DIR}/dist",
+                env: {
+                  NODE_ENV: "production"
+                }
+              }]
+            }
+            ECO
+
+      - name: Confirm remote service status
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT || 22 }}
+          script: |
+            pm2 status lti-backend || true
