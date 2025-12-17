@@ -12,22 +12,22 @@ jobs:
     outputs:
       has_pr: ${{ steps.check.outputs.has_pr }}
     steps:
-      - name: Check if current branch has an open PR (fork-safe)
+      - name: Detect open PR for pushed branch (authoritative)
         id: check
         uses: actions/github-script@v6
         with:
           script: |
             const branch = context.ref.replace('refs/heads/', '');
-            const headOwner = context.actor; // fork owner or repo owner
 
             const { data: prs } = await github.rest.pulls.list({
-              owner: context.repo.owner, // base repo
+              owner: context.repo.owner,
               repo: context.repo.repo,
-              state: 'open',
-              head: `${headOwner}:${branch}`
+              state: 'open'
             });
 
-            core.setOutput('has_pr', prs.length > 0 ? 'true' : 'false');
+            const hasPr = prs.some(pr => pr.head.ref === branch);
+
+            core.setOutput('has_pr', hasPr ? 'true' : 'false');
 
   build-and-test:
     name: Run backend tests and build
