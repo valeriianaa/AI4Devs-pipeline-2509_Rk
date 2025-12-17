@@ -12,24 +12,19 @@ jobs:
     outputs:
       has_pr: ${{ steps.check.outputs.has_pr }}
     steps:
-      - name: Determine current branch
-        id: ref
-        run: echo "branch=$(echo ${GITHUB_REF#refs/heads/})" >> "$GITHUB_OUTPUT"
-
-      - name: Check if current branch has an open PR
+      - name: Check if current branch has an open PR (fork-safe)
         id: check
         uses: actions/github-script@v6
         with:
           script: |
-            const branch =
-              process.env.branch ||
-              process.env.GITHUB_REF.replace('refs/heads/', '');
+            const branch = context.ref.replace('refs/heads/', '');
+            const headOwner = context.actor; // fork owner or repo owner
 
             const { data: prs } = await github.rest.pulls.list({
-              owner: context.repo.owner,
+              owner: context.repo.owner, // base repo
               repo: context.repo.repo,
               state: 'open',
-              head: `${context.repo.owner}:${branch}`
+              head: `${headOwner}:${branch}`
             });
 
             core.setOutput('has_pr', prs.length > 0 ? 'true' : 'false');
@@ -91,7 +86,7 @@ jobs:
       - name: Package artifact
         run: |
           mkdir -p deploy
-          tar -czf deploy/backend-dist.tar.gz -C artifact dist
+          tar -czf deploy/backend-dist.tar.gz -C artifact .
 
       - name: Copy build to EC2 (SCP)
         uses: appleboy/scp-action@master
@@ -123,19 +118,9 @@ jobs:
 
             cd "$DEPLOY_DIR/dist" || exit 1
 
-            pm2 startOrReload <(cat <<'ECO'
-            module.exports = {
-              apps : [{
-                name: "lti-backend",
-                script: "index.js",
-                cwd: process.env.DEPLOY_DIR || "./",
-                env: {
-                  NODE_ENV: "production"
-                }
-              }]
-            }
-            ECO
-            )
+            pm2 startOrReload index.js \
+              --name lti-backend \
+              --update-env
 
       - name: Confirm remote service status
         uses: appleboy/ssh-action@master
