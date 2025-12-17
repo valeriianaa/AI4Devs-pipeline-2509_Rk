@@ -10,7 +10,7 @@ jobs:
     name: Check for open PR on branch
     runs-on: ubuntu-latest
     outputs:
-      has-pr: ${{ steps.check.outputs.has_pr }}
+      has_pr: ${{ steps.check.outputs.has_pr }}
     steps:
       - name: Determine current branch
         id: ref
@@ -21,19 +21,23 @@ jobs:
         uses: actions/github-script@v6
         with:
           script: |
-            const branch = process.env.branch || process.env.GITHUB_REF.replace('refs/heads/','');
+            const branch =
+              process.env.branch ||
+              process.env.GITHUB_REF.replace('refs/heads/', '');
+
             const { data: prs } = await github.rest.pulls.list({
               owner: context.repo.owner,
               repo: context.repo.repo,
               state: 'open',
               head: `${context.repo.owner}:${branch}`
             });
+
             core.setOutput('has_pr', prs.length > 0 ? 'true' : 'false');
 
   build-and-test:
     name: Run backend tests and build
     needs: check-pr
-    if: needs.check-pr.outputs.has-pr == 'true'
+    if: needs.check-pr.outputs.has_pr == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -74,8 +78,8 @@ jobs:
 
   deploy-to-ec2:
     name: Deploy backend to EC2
-    needs: build-and-test
-    if: needs.check-pr.outputs.has-pr == 'true'
+    needs: [check-pr, build-and-test]
+    if: needs.check-pr.outputs.has_pr == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Download backend build artifact
@@ -111,25 +115,27 @@ jobs:
             DEPLOY_DIR="${{ secrets.EC2_DEPLOY_PATH }}"
             mkdir -p "$DEPLOY_DIR"
             tar -xzf "$DEPLOY_DIR/backend-dist.tar.gz" -C "$DEPLOY_DIR"
-            # Create .env from secrets (adjust variables as needed)
+
             cat > "$DEPLOY_DIR/.env" <<'EOF'
             DATABASE_URL=${{ secrets.DATABASE_URL }}
             NODE_ENV=production
             EOF
+
             cd "$DEPLOY_DIR/dist" || exit 1
-            # Ensure pm2 is installed on the server (assumed already installed per README)
-            pm2 startOrReload <(cat <<'ECO')
+
+            pm2 startOrReload <(cat <<'ECO'
             module.exports = {
               apps : [{
                 name: "lti-backend",
                 script: "index.js",
-                cwd: "${DEPLOY_DIR}/dist",
+                cwd: process.env.DEPLOY_DIR || "./",
                 env: {
                   NODE_ENV: "production"
                 }
               }]
             }
             ECO
+            )
 
       - name: Confirm remote service status
         uses: appleboy/ssh-action@master
@@ -138,5 +144,4 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           port: ${{ secrets.EC2_SSH_PORT || 22 }}
-          script: |
-            pm2 status lti-backend || true
+          script: pm2 status lti-backend || true
